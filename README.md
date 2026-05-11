@@ -28,6 +28,46 @@
 
 ---
 
+## 目录
+
+- [学习路线](#学习路线)
+- [第一部分：Go 并发基础](#第一部分go-并发基础)
+  - [1. goroutine：不是免费的线程](#1-goroutine不是免费的线程)
+  - [2. channel：带同步语义的队列](#2-channel带同步语义的队列)
+  - [3. Mutex 与 RWMutex：保护不变量](#3-mutex-与-rwmutex保护不变量)
+  - [4. sync.Map：特殊场景下的并发 Map](#4-syncmap特殊场景下的并发-map)
+  - [5. context：让并发任务知道什么时候该停](#5-context让并发任务知道什么时候该停)
+- [第二部分：高性能数据结构](#第二部分高性能数据结构)
+  - [6. Heap：用局部有序换取效率](#6-heap用局部有序换取效率)
+  - [7. 优先队列：让重要任务先执行](#7-优先队列让重要任务先执行)
+  - [8. TreeMap 与 Skiplist：为范围查询而生](#8-treemap-与-skiplist为范围查询而生)
+- [第三部分：并发数据结构设计](#第三部分并发数据结构设计)
+  - [9. 线程安全的本质](#9-线程安全的本质)
+- [第四部分：算法优化](#第四部分算法优化)
+  - [10. Top K：不要为无关数据排序](#10-top-k不要为无关数据排序)
+  - [11. 高频访问优化](#11-高频访问优化)
+  - [12. 增量聚合：把查询成本前移](#12-增量聚合把查询成本前移)
+- [第五部分：工程化设计](#第五部分工程化设计)
+  - [13. 接口设计](#13-接口设计)
+  - [14. 错误处理](#14-错误处理)
+  - [15. 日志、指标与测试](#15-日志指标与测试)
+- [第六部分：高并发系统设计](#第六部分高并发系统设计)
+  - [16. Worker Pool：给系统设置边界](#16-worker-pool给系统设置边界)
+  - [17. Fan-out / Fan-in：并行也会放大流量](#17-fan-out--fan-in并行也会放大流量)
+  - [18. Backpressure：承认系统有容量上限](#18-backpressure承认系统有容量上限)
+  - [19. 限流：系统的安全阀](#19-限流系统的安全阀)
+- [第七部分：实战项目](#第七部分实战项目)
+  - [20. Leaderboard 高级实现](#20-leaderboard-高级实现)
+  - [21. ActivityTracker 高级实现](#21-activitytracker-高级实现)
+- [附录 A：补充并发原语](#附录-a补充并发原语)
+- [附录 B：优雅关闭与熔断降级](#附录-b优雅关闭与熔断降级)
+- [高并发设计检查清单](#高并发设计检查清单)
+- [常见线上故障模式](#常见线上故障模式)
+- [生产排障手册](#生产排障手册)
+- [结语](#结语)
+
+---
+
 ## 学习路线
 
 建议用 12 周完成这套训练。
@@ -116,7 +156,7 @@ flowchart LR
 | 少量异步任务 | 可以直接启动 goroutine |
 | 大量独立任务 | 使用 worker pool |
 | 请求内并行访问多个下游 | 使用 fan-out，并配合 `context` |
-| CPU 密集任务 | 并发度接近 `GOMAXPROCS` |
+| CPU 密集任务 | 并发度接近 `runtime.GOMAXPROCS(0)` |
 | IO 密集任务 | 根据下游承载能力设置并发上限 |
 
 ### 1.3 示例：并发抓取用户信息
@@ -444,7 +484,7 @@ go func() {
 
 #### 坑 2：从已关闭 channel 接收零值，误以为是真数据
 
-为什么会出现：从已关闭且已 drain 的 channel 接收不会阻塞，会立刻返回元素类型的零值。如果不检查 `ok`，业务可能把零值当成正常数据。
+为什么会出现：从已关闭且已被读空的 channel 接收不会阻塞，会立刻返回元素类型的零值。如果不检查 `ok`，业务可能把零值当成正常数据。
 
 错误示例：
 
@@ -868,6 +908,22 @@ func (c *Conn) SetAddr(addr string) {
 ```
 
 更推荐的方式是不可变替换：构造一个新的 value，再 `Store` 回去，避免调用方拿到可变内部对象。
+
+```go
+func (r *Registry) UpdateAddr(userID int64, addr string) {
+	v, ok := r.conns.Load(userID)
+	if !ok {
+		return
+	}
+	old := v.(*Conn)
+
+	// 构造一份新的不可变 Conn，整体替换
+	updated := &Conn{UserID: old.UserID, Addr: addr}
+	r.conns.Store(userID, updated)
+}
+```
+
+不可变替换的好处是读者拿到的 `*Conn` 永远不会被别人改动。读者看到的是某个时刻的快照，也就不需要再对 value 加锁。
 
 #### 坑 2：把 `Range` 当成强一致快照
 
@@ -1444,10 +1500,10 @@ Go 中的数据竞争是指：
 flowchart LR
     Key["key"] --> Hash["hash(key)"]
     Hash --> Pick["hash % shardCount"]
-    Pick --> S0["Shard 0\nmap + lock"]
-    Pick --> S1["Shard 1\nmap + lock"]
-    Pick --> S2["Shard 2\nmap + lock"]
-    Pick --> SN["Shard N\nmap + lock"]
+    Pick --> S0["Shard 0<br/>map + lock"]
+    Pick --> S1["Shard 1<br/>map + lock"]
+    Pick --> S2["Shard 2<br/>map + lock"]
+    Pick --> SN["Shard N<br/>map + lock"]
 ```
 
 ```go
@@ -1460,6 +1516,20 @@ type shard struct {
 
 type ShardedCounter struct {
 	shards [shardCount]*shard
+}
+
+func NewShardedCounter() *ShardedCounter {
+	c := &ShardedCounter{}
+	for i := range c.shards {
+		c.shards[i] = &shard{m: make(map[string]int64)}
+	}
+	return c
+}
+
+func (c *ShardedCounter) getShard(key string) *shard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return c.shards[h.Sum32()%shardCount]
 }
 ```
 
@@ -1593,7 +1663,7 @@ flowchart TD
 
 缓存问题的参考答案与生产解读：
 
-- 缓存击穿的最佳做法是 singleflight。多个请求同时发现热点 key 过期时，只允许一个请求回源，其余请求等待结果或使用旧值。
+- 缓存击穿的最佳做法是 singleflight。多个请求同时发现热点 key 过期时，只允许一个请求回源，其余请求等待结果或使用旧值。完整代码示例见[附录 A.5](#a5-singleflight合并重复请求)。
 - 缓存穿透要缓存“不存在”的结果，但 TTL 要短，避免后来数据创建后仍长期返回不存在。
 - 缓存雪崩要给 TTL 加随机抖动，例如基础 TTL 10 分钟，额外随机 0 到 60 秒，避免大量 key 同时失效。
 - 热点 key 可以做本地缓存、多副本缓存、读写分离或提前预热。极端热点下，单个 Redis key 本身也会成为瓶颈。
@@ -2032,9 +2102,9 @@ flowchart TD
     Service --> Manager["BoardManager"]
     Manager --> B1["Board: daily"]
     Manager --> B2["Board: weekly"]
-    B1 --> S0["Shard 0\nscores + local ranking"]
-    B1 --> S1["Shard 1\nscores + local ranking"]
-    B1 --> S2["Shard 2\nscores + local ranking"]
+    B1 --> S0["Shard 0<br/>scores + local ranking"]
+    B1 --> S1["Shard 1<br/>scores + local ranking"]
+    B1 --> S2["Shard 2<br/>scores + local ranking"]
     S0 --> Merge["Periodic Merge"]
     S1 --> Merge
     S2 --> Merge
@@ -2042,7 +2112,7 @@ flowchart TD
     Service --> Snapshot
 ```
 
-设计思路：
+### 20.1 设计思路
 
 - 写入按 member 分片。
 - 每个分片维护局部数据。
@@ -2050,7 +2120,7 @@ flowchart TD
 - 读请求读取不可变快照。
 - 对用户排名可以提供“实时分数 + 快照排名”语义。
 
-常见坑：
+### 20.2 常见坑
 
 #### 坑 1：每次写入都全量排序
 
@@ -2113,7 +2183,7 @@ score desc, updated_at asc, member_id asc
 
 这能用很小的业务延迟换来更高吞吐和更稳定的尾延迟。
 
-项目练习：
+### 20.3 项目练习
 
 1. 实现多榜单 `BoardManager`。
 2. 实现后台每秒刷新 Top 100。
@@ -2121,7 +2191,7 @@ score desc, updated_at asc, member_id asc
 4. 对 10 万、100 万用户做 benchmark。
 5. 增加 HTTP API 和压测脚本。
 
-参考实现方向：
+### 20.4 参考实现方向
 
 - `BoardManager` 用 `map[string]*Board + RWMutex` 管理榜单。榜单数量变化不频繁时，这比 `sync.Map` 更容易保证类型安全和初始化语义。
 - 每个 `Board` 内部按 member hash 分成多个 shard。写入只锁对应 shard，避免所有用户更新争抢一把锁。
@@ -2130,7 +2200,7 @@ score desc, updated_at asc, member_id asc
 - `Rank` 可以分两种语义：实时计算精确排名，或者返回快照排名。生产中建议先提供快照排名，并在 API 文档中说明刷新周期。
 - benchmark 要分别测写入吞吐、TopN 延迟、快照合并耗时、内存占用。不要只测单个函数平均耗时。
 
-生产最佳实践：
+### 20.5 生产最佳实践
 
 - 排名规则必须稳定。推荐按 `score desc, updated_at asc, member_id asc` 排序。
 - `TopN` 返回结果要复制，不能把内部快照切片直接暴露给调用方修改。
@@ -2171,7 +2241,7 @@ flowchart TD
     Queue -->|full| Busy["Backpressure: busy / degrade"]
 ```
 
-设计思路：
+### 21.1 设计思路
 
 - 写入先进入有界队列。
 - 队列满时快速失败或降级。
@@ -2180,7 +2250,7 @@ flowchart TD
 - 查询优先读取聚合桶。
 - 过期桶定期清理。
 
-常见坑：
+### 21.2 常见坑
 
 #### 坑 1：队列无上限
 
@@ -2239,7 +2309,7 @@ func (t *Tracker) Record(ctx context.Context, e Event) error {
 
 生产建议：重要统计必须保留原始事件流或明细日志。聚合结果是加速查询的派生数据，不应是唯一事实来源。
 
-项目练习：
+### 21.3 项目练习
 
 1. 实现 64 分片聚合。
 2. 实现分钟桶、小时桶、天桶。
@@ -2247,7 +2317,7 @@ func (t *Tracker) Record(ctx context.Context, e Event) error {
 4. 暴露队列长度、写入失败数、处理延迟。
 5. 实现优雅关闭。
 
-参考实现方向：
+### 21.4 参考实现方向
 
 - 写入入口只做轻量校验和入队，不在请求路径里做复杂聚合。
 - 队列使用有界 channel，满了返回 `ErrBusy` 或降级，不能无限阻塞。
@@ -2256,13 +2326,338 @@ func (t *Tracker) Record(ctx context.Context, e Event) error {
 - `TopActions` 查询时先在每个 shard 内计算局部 Top K，再归并全局 Top K。
 - 优雅关闭分两步：先停止接收新事件，再 drain 队列，最后 flush 聚合状态。
 
-生产最佳实践：
+### 21.5 生产最佳实践
 
 - 事件要有唯一 ID 或幂等键，避免消息重试导致重复计数。
 - 保存原始事件日志或消息流，方便口径变化后重算。
 - 明确迟到事件策略，例如只修正最近 10 分钟，超过窗口进入离线补偿。
 - 指标至少包括入队成功数、入队失败数、队列长度、消费延迟、聚合耗时、桶数量、丢弃数。
 - 如果查询跨度很大，禁止扫描过多分钟桶，应自动切换到小时桶或天桶。
+
+---
+
+# 附录 A：补充并发原语
+
+除了 goroutine、channel、锁和 `context`，Go 标准库和 `golang.org/x/sync` 还提供了几个常用的并发原语。它们解决的场景更具体，但在高并发系统里非常实用。
+
+## A.1 atomic：无锁计数与标志位
+
+`sync/atomic` 提供底层原子操作。适合单个数值的并发读写，例如计数器、开关、版本号。Go 1.19 引入了面向对象的 `atomic.Int64`、`atomic.Pointer[T]` 等类型，推荐优先使用。
+
+```go
+type Counter struct {
+	n atomic.Int64
+}
+
+func (c *Counter) Inc()          { c.n.Add(1) }
+func (c *Counter) Value() int64  { return c.n.Load() }
+```
+
+使用 atomic 的几点注意：
+
+- 只适合保护单个字段。多个字段构成不变量时，仍需锁或原子替换整个结构。
+- `atomic.Value` 和 `atomic.Pointer[T]` 适合整体替换一个不可变快照，是实现 copy-on-write 的基础。
+- 不要对 `int` 或 `int64` 裸字段混用 atomic 和普通读写，会被 race detector 检测为竞争。
+
+## A.2 sync.Once：只执行一次的初始化
+
+`sync.Once` 保证某段代码在进程生命周期内只执行一次，线程安全且开销很小。常用于懒加载单例、初始化连接池、注册 metrics。
+
+```go
+var (
+	once   sync.Once
+	client *http.Client
+)
+
+func HTTPClient() *http.Client {
+	once.Do(func() {
+		client = &http.Client{Timeout: 3 * time.Second}
+	})
+	return client
+}
+```
+
+要点：
+
+- 如果 `Do` 中的函数 panic，`sync.Once` 仍认为“已执行”，后续调用不会重试。需要时要在 `Do` 内自己 recover 并重置。
+- Go 1.21 引入了 `sync.OnceFunc`、`sync.OnceValue`、`sync.OnceValues`，写法更简洁，推荐在新代码里使用。
+
+## A.3 sync.Pool：复用临时对象
+
+`sync.Pool` 用来复用短期对象，降低 GC 压力。典型场景是 JSON 编解码缓冲、`bytes.Buffer`、临时切片。
+
+```go
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+func Format(v any) string {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	fmt.Fprintf(buf, "%v", v)
+	return buf.String()
+}
+```
+
+要点：
+
+- Pool 里的对象随时可能被 GC 回收，不能用来做“缓存”。
+- 放回前必须 Reset，避免污染下一个使用者。
+- 不要把已经被别人引用的对象放回 Pool，否则会导致数据竞争。
+- 只对热路径和大对象使用。小对象直接 new 通常更简单，GC 代价也不大。
+
+## A.4 errgroup：并发等待 + 错误短路
+
+`golang.org/x/sync/errgroup` 是 fan-out 场景最常用的工具。它封装了 `WaitGroup` + 错误收集 + context 取消。
+
+```go
+import "golang.org/x/sync/errgroup"
+
+func Aggregate(ctx context.Context, userID int64) (Profile, error) {
+	g, ctx := errgroup.WithContext(ctx)
+
+	var (
+		base    BaseInfo
+		orders  []Order
+		credits int64
+	)
+
+	g.Go(func() (err error) {
+		base, err = loadBase(ctx, userID)
+		return
+	})
+	g.Go(func() (err error) {
+		orders, err = loadOrders(ctx, userID)
+		return
+	})
+	g.Go(func() (err error) {
+		credits, err = loadCredits(ctx, userID)
+		return
+	})
+
+	if err := g.Wait(); err != nil {
+		return Profile{}, err
+	}
+	return Profile{Base: base, Orders: orders, Credits: credits}, nil
+}
+```
+
+要点：
+
+- 任何子任务返回 error，`errgroup` 会自动 cancel 关联的 ctx，其它子任务应尽快退出。
+- Go 1.20 之后的 `errgroup.SetLimit(n)` 可以限制同时运行的 goroutine 数，非常适合批量 fan-out。
+- 子任务内部必须检查 `ctx.Done()`，否则 cancel 没有意义。
+
+## A.5 singleflight：合并重复请求
+
+`golang.org/x/sync/singleflight` 把相同 key 的并发请求合并成一次。典型场景是缓存击穿：热点 key 过期的瞬间，不要让成百上千的请求同时打到数据库。
+
+```go
+import "golang.org/x/sync/singleflight"
+
+var g singleflight.Group
+
+func GetUser(ctx context.Context, id int64) (*User, error) {
+	key := fmt.Sprintf("user:%d", id)
+
+	v, err, _ := g.Do(key, func() (any, error) {
+		// 同一时刻相同 key 只有一个 goroutine 进入这里
+		return loadUserFromDB(ctx, id)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*User), nil
+}
+```
+
+要点：
+
+- 合并的是“同一 key 的回源”，不是整个接口的调用。
+- 一个请求失败，所有在等待的请求也会收到同一个错误。如果希望失败不传染，可以在回调里捕获错误。
+- 对于延迟很高的上游（比如外部 API），`DoChan` 配合 `select` 更灵活，调用方可以自己决定是否放弃等待。
+
+## A.6 小结
+
+| 原语 | 适用场景 | 不适合的场景 |
+| --- | --- | --- |
+| `atomic` | 计数器、标志位、快照指针替换 | 多字段不变量 |
+| `sync.Once` | 懒加载单例、一次性初始化 | 需要重试或条件重置 |
+| `sync.Pool` | 复用临时 buffer、临时对象 | 当成长期缓存 |
+| `errgroup` | 并发 fan-out + 错误短路 | 每个子任务必须独立成功 |
+| `singleflight` | 缓存击穿、合并重复回源 | 每个请求结果需要互不影响 |
+
+---
+
+# 附录 B：优雅关闭与熔断降级
+
+## B.1 优雅关闭
+
+服务关闭不是“杀进程”。粗暴地退出会导致正在处理的请求失败、写入中的数据丢失、下游连接被强制断开。优雅关闭的目标是：收到停止信号后，先停止接收新请求，再等待已接收的请求完成，最后释放资源。
+
+典型流程：
+
+```text
+1. 捕获 SIGINT / SIGTERM
+2. 停止接收新请求（关闭监听、取消健康检查）
+3. 通知后台 goroutine 退出
+4. 等待在途请求处理完成（有最大等待时间）
+5. flush 聚合状态、关闭数据库连接、上报下线
+6. 进程退出
+```
+
+HTTP 服务的标准做法：
+
+```go
+func Run(ctx context.Context, srv *http.Server) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	}
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{Addr: ":8080", Handler: router}
+	if err := Run(ctx, srv); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+后台 worker pool 的优雅关闭分两步：先关闭入口（不再接收新任务），再等待队列 drain 完成或超时：
+
+```go
+func (p *Pool) Shutdown(ctx context.Context) error {
+	p.closeOnce.Do(func() { close(p.closed) }) // 拒绝新任务
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait() // 等待在途任务完成
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err() // 超时后强制退出，记录未完成任务数
+	}
+}
+```
+
+要点：
+
+- 必须设置 shutdown 超时。永远等下去等于没有关闭。
+- 关闭顺序要倒着来：先入口、再业务、最后基础设施（DB、MQ、缓存）。
+- 关闭前把健康检查置为失败，让负载均衡尽快摘除自己。Kubernetes 环境下要配合 `preStop` hook 和 `terminationGracePeriodSeconds`。
+- 异步任务要区分“可丢弃”和“必须完成”。必须完成的任务在关闭前应落盘或转移到持久队列。
+
+## B.2 熔断（Circuit Breaker）
+
+熔断的作用是在下游持续失败时，主动断开调用，避免把自己拖垮。它是 fan-out、重试、缓存之外的最后一道屏障。
+
+熔断器有三个状态：
+
+| 状态 | 含义 | 行为 |
+| --- | --- | --- |
+| Closed | 正常 | 请求直通，失败计数累积 |
+| Open | 断路 | 请求立即失败（fail fast），不调用下游 |
+| Half-Open | 试探 | 放行少量请求，根据结果决定回到 Closed 或 Open |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: 失败率 > 阈值
+    Open --> HalfOpen: 冷却时间到
+    HalfOpen --> Closed: 试探成功
+    HalfOpen --> Open: 试探失败
+```
+
+常见实现库：`sony/gobreaker`、`afex/hystrix-go`、`resilience4j`（Java 参考）。
+
+```go
+import "github.com/sony/gobreaker"
+
+var cb = gobreaker.NewCircuitBreaker(gobreaker.Settings{
+	Name:        "user-service",
+	MaxRequests: 3,
+	Interval:    60 * time.Second,
+	Timeout:     10 * time.Second,
+	ReadyToTrip: func(counts gobreaker.Counts) bool {
+		return counts.ConsecutiveFailures > 10
+	},
+})
+
+func GetUser(ctx context.Context, id int64) (*User, error) {
+	v, err := cb.Execute(func() (any, error) {
+		return loadUserFromRPC(ctx, id)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*User), nil
+}
+```
+
+要点：
+
+- 熔断粒度要合理。按“服务+接口”或“服务+上游依赖”维度，不要一个熔断器覆盖整个进程。
+- 熔断开启时要返回明确错误，并且要有指标和告警。长期 Open 说明下游真的有问题。
+- 和超时、重试配合使用。熔断不能替代超时；超时保证单次请求快速失败，熔断保证持续失败时不再尝试。
+- 幂等写入才可以重试。熔断打开期间的请求通常不应进入重试队列。
+
+## B.3 降级（Fallback）
+
+降级是在系统部分能力不可用时，返回一个“次优但可用”的结果。它不是对业务的妥协，而是对用户体验的守护。
+
+常见降级方式：
+
+| 场景 | 降级策略 |
+| --- | --- |
+| 推荐服务不可用 | 返回热门商品或静态列表 |
+| 个性化价格不可用 | 返回原价 |
+| 风控服务超时 | 走保守规则（拒绝或人工审核） |
+| 缓存集群故障 | 直接走 DB，同时限流保护 |
+| 监控/埋点不可用 | 本地缓冲或直接丢弃，不阻塞主流程 |
+
+实现降级的两种常见形态：
+
+1. **被动降级**：调用失败或超时后回落到备用逻辑。适合偶发故障。
+2. **主动降级**：通过配置或开关强制跳过某些能力。适合发布期、大促期间预先关闭非核心功能。
+
+要点：
+
+- 降级结果要清晰标注。例如在响应里加 `degraded: true` 或日志里标记 `fallback=cache-miss`，便于排查。
+- 降级路径也要有容量保护。大促期间，所有请求同时回落到 DB 会让数据库直接崩溃。
+- 降级不能悄悄损失核心数据。涉及扣款、发货、库存等强一致场景，宁可失败也不降级。
+- 演练比设计更重要。定期在预发环境关闭某个下游，验证降级路径是否真正生效。
+
+熔断、限流、降级、背压不是四件独立的工具，而是一套组合拳：
+
+```text
+限流：在入口限制进入速率
+背压：向上游表明“我满了”
+熔断：在下游故障时主动断开
+降级：在能力缺失时返回次优结果
+```
+
+组合使用，系统才能在过载和故障下保持“可预期的失败”。
 
 ---
 
