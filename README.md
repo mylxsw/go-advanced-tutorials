@@ -1492,6 +1492,133 @@ Go 中的数据竞争是指：
 | 消息传递 | 状态顺序更新 | 不容易数据竞争 | 单点吞吐有限 |
 | 不可变快照 | 读多写少 | 读路径快 | 写入复制成本高 |
 
+这三种方案不是互斥的。生产系统经常混合使用：写路径用锁维护真实状态，读路径用不可变快照；或者入口用 channel 排队，内部用锁保护 Map。关键是先确定状态的所有权。
+
+#### 方案一：共享内存 + 锁
+
+这是最通用的方案。多个 goroutine 直接访问同一份状态，但所有访问都必须经过同一把锁。
+
+```go
+type Balance struct {
+	mu     sync.Mutex
+	amount int64
+}
+
+func (b *Balance) Deposit(delta int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.amount += delta
+}
+
+func (b *Balance) Withdraw(delta int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.amount < delta {
+		return false
+	}
+	b.amount -= delta
+	return true
+}
+
+func (b *Balance) Value() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.amount
+}
+```
+
+这段代码保护的不只是 `amount` 这个字段，而是“余额不能被并发写坏，且扣款不能扣成负数”这个不变量。`Withdraw` 里的检查和扣减必须在同一个临界区内完成。如果先检查、释放锁、再扣减，两个 goroutine 可能同时看到余额充足，最后把余额扣成负数。
+
+生产中使用锁时，要给自己设一个检查清单：
+
+- 哪些字段由这把锁保护？
+- 哪些方法会读写这些字段？
+- 是否有任何路径绕过了锁？
+- 临界区内是否存在 RPC、DB、文件 IO、日志刷盘这类慢操作？
+
+#### 方案二：消息传递
+
+消息传递的思路是让一个 goroutine 独占状态，其他 goroutine 不直接修改状态，只发送命令。
+
+```go
+type accountCmd struct {
+	kind  string
+	delta int64
+	reply chan int64
+	ok    chan bool
+}
+
+type AccountActor struct {
+	ch chan accountCmd
+}
+
+func NewAccountActor(initial int64) *AccountActor {
+	a := &AccountActor{ch: make(chan accountCmd, 1024)}
+	go a.loop(initial)
+	return a
+}
+
+func (a *AccountActor) loop(balance int64) {
+	for cmd := range a.ch {
+		switch cmd.kind {
+		case "deposit":
+			balance += cmd.delta
+			cmd.reply <- balance
+		case "withdraw":
+			if balance >= cmd.delta {
+				balance -= cmd.delta
+				cmd.ok <- true
+			} else {
+				cmd.ok <- false
+			}
+		case "value":
+			cmd.reply <- balance
+		}
+	}
+}
+```
+
+这个模型的原理是“状态串行化”。所有修改都在 `loop` 里按顺序发生，所以不需要锁。但它并不是免费午餐：单个 actor 只有一个 goroutine 处理命令，如果请求量太大，channel 会积压。因此生产中通常按 `accountID`、`roomID`、`boardID` 做分区，让多个 actor 分摊压力。
+
+#### 方案三：不可变快照
+
+不可变快照适合读多写少的数据，例如配置、规则、路由表、榜单 TopN。读请求直接拿当前快照，写请求构造一份新快照后一次性替换。
+
+```go
+type RouteTable struct {
+	value atomic.Value // stores map[string]string
+}
+
+func NewRouteTable() *RouteTable {
+	t := &RouteTable{}
+	t.value.Store(map[string]string{})
+	return t
+}
+
+func (t *RouteTable) Get(path string) (string, bool) {
+	routes := t.value.Load().(map[string]string)
+	target, ok := routes[path]
+	return target, ok
+}
+
+func (t *RouteTable) Update(path string, target string) {
+	old := t.value.Load().(map[string]string)
+	next := make(map[string]string, len(old)+1)
+	for k, v := range old {
+		next[k] = v
+	}
+	next[path] = target
+	t.value.Store(next)
+}
+```
+
+关键原则是：发布出去的 `map` 不能再修改。`atomic.Value` 只保证指针替换是安全的，不会让 Map 本身变成并发安全。如果 `Update` 直接改 `old[path]`，读者仍然会和写者并发访问同一个 Map。
+
+生产实践中，不可变快照常用在“读极多、写很少、允许读到上一版本”的场景。比如灰度规则每几秒更新一次，读请求每秒几十万次。让每个读请求加锁会把系统拖慢，而快照替换能让读路径接近普通 Map 查询。
+
 ### 9.2 分片 Map
 
 全局一把锁的问题是所有请求都排队。分片 Map 把一个大 Map 拆成多个小 Map，每个 shard 有自己的锁。
@@ -1547,6 +1674,51 @@ func (c *ShardedCounter) Add(key string, delta int64) {
 
 分片不是越多越好。分片越多，全量遍历和内存成本也越高。常见起点是 32、64、128，然后通过 benchmark 调整。
 
+为了让这个结构能在真实代码中使用，还需要补上读取、快照和删除。下面是一个完整的计数器版本：
+
+```go
+func (c *ShardedCounter) Value(key string) int64 {
+	s := c.getShard(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.m[key]
+}
+
+func (c *ShardedCounter) Delete(key string) {
+	s := c.getShard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.m, key)
+}
+
+func (c *ShardedCounter) Snapshot() map[string]int64 {
+	result := make(map[string]int64)
+
+	for _, s := range c.shards {
+		s.mu.RLock()
+		for k, v := range s.m {
+			result[k] = v
+		}
+		s.mu.RUnlock()
+	}
+
+	return result
+}
+```
+
+`Snapshot` 需要特别解释。它逐个 shard 加读锁并复制数据，而不是直接返回内部 Map。这样调用方拿到的是一份普通副本，后续怎么遍历、排序、序列化，都不会阻塞写入路径，也不会破坏内部状态。
+
+但这个快照不是严格同一时刻的全局快照。它复制 shard 0 时，shard 1 可能还在变化。如果业务需要“所有 shard 在同一个时间点完全一致”，就要引入全局版本、双缓冲快照，或者暂停写入后复制。多数统计、缓存、排行榜 TopN 场景可以接受这种弱一致；账务、库存、强一致扣减则不应该用这种方式。
+
+生产使用方式：
+
+- 分片 Map 适合 key 分布比较均匀的计数、缓存、状态表。
+- 如果某个 key 是超级热点，分片锁也没用，因为热点永远落在同一个 shard。
+- 全量遍历会扫所有 shard，不适合高频调用。高频 TopN 应该用后台快照，而不是请求来了再 `Snapshot + sort`。
+- shard 数量应该固定或很少调整。动态扩容会涉及数据迁移，复杂度接近自己实现一个并发哈希表。
+
 ### 9.3 Copy-on-write 快照
 
 配置、规则、路由表这类数据通常读很多，写很少。适合写时复制：
@@ -1565,6 +1737,59 @@ type Store struct {
 
 关键原则：快照发布后不能再修改。否则读者虽然无锁，仍然可能读到被并发修改的数据。
 
+下面以“风控规则表”为例。读请求根据用户类型找规则，后台定时加载新规则：
+
+```go
+type Rule struct {
+	MaxAmount int64
+	Enabled   bool
+}
+
+type RuleSnapshot struct {
+	Version int64
+	Rules   map[string]Rule
+}
+
+type RuleStore struct {
+	value atomic.Value // stores *RuleSnapshot
+}
+
+func NewRuleStore() *RuleStore {
+	s := &RuleStore{}
+	s.value.Store(&RuleSnapshot{Rules: map[string]Rule{}})
+	return s
+}
+
+func (s *RuleStore) Match(userType string) (Rule, bool) {
+	snapshot := s.value.Load().(*RuleSnapshot)
+	rule, ok := snapshot.Rules[userType]
+	return rule, ok
+}
+
+func (s *RuleStore) Replace(version int64, rules map[string]Rule) {
+	next := make(map[string]Rule, len(rules))
+	for k, v := range rules {
+		next[k] = v
+	}
+
+	s.value.Store(&RuleSnapshot{
+		Version: version,
+		Rules:   next,
+	})
+}
+```
+
+为什么 `Replace` 里还要复制传入的 `rules`？因为调用方传进来的 Map 可能还会被它自己修改。如果直接保存引用，就把外部可变对象发布给了所有读者。生产代码里，任何要放进快照的 Map、slice、指针对象，都要确认是否真的不可变。
+
+Copy-on-write 的典型落地：
+
+- 配置中心下发规则，服务内原子替换。
+- API 网关路由表、限流规则、灰度规则。
+- 搜索、推荐、排行榜的读快照。
+- 本地缓存的整批刷新。
+
+它不适合高频写入。如果每秒更新几万次，每次都复制整个 Map，CPU 和内存分配会很高。此时应改用锁、分片锁或增量数据结构。
+
 ### 9.4 Actor 模型
 
 Actor 模型让一个 goroutine 独占状态，其他 goroutine 通过消息请求它修改状态。
@@ -1572,6 +1797,92 @@ Actor 模型让一个 goroutine 独占状态，其他 goroutine 通过消息请�
 它适合强顺序场景，比如账户余额、库存扣减、房间状态。
 
 优点是顺序清晰，缺点是单个 Actor 吞吐有限。高并发下通常要按用户 ID、房间 ID、订单 ID 做分区。
+
+下面是一个更接近生产的库存 Actor。它支持扣减、查询和关闭：
+
+```go
+var ErrInsufficientStock = errors.New("insufficient stock")
+
+type stockRequest struct {
+	op    string
+	n     int64
+	reply chan stockResponse
+}
+
+type stockResponse struct {
+	value int64
+	err   error
+}
+
+type StockActor struct {
+	ch     chan stockRequest
+	closed chan struct{}
+}
+
+func NewStockActor(initial int64) *StockActor {
+	a := &StockActor{
+		ch:     make(chan stockRequest, 1024),
+		closed: make(chan struct{}),
+	}
+	go a.loop(initial)
+	return a
+}
+
+func (a *StockActor) loop(stock int64) {
+	defer close(a.closed)
+
+	for req := range a.ch {
+		switch req.op {
+		case "deduct":
+			if stock < req.n {
+				req.reply <- stockResponse{value: stock, err: ErrInsufficientStock}
+				continue
+			}
+			stock -= req.n
+			req.reply <- stockResponse{value: stock}
+		case "value":
+			req.reply <- stockResponse{value: stock}
+		}
+	}
+}
+
+func (a *StockActor) Deduct(ctx context.Context, n int64) (int64, error) {
+	reply := make(chan stockResponse, 1)
+	req := stockRequest{op: "deduct", n: n, reply: reply}
+
+	select {
+	case a.ch <- req:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	select {
+	case resp := <-reply:
+		return resp.value, resp.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (a *StockActor) Close() {
+	close(a.ch)
+	<-a.closed
+}
+```
+
+这段代码里有两个重要细节：
+
+1. `reply` 是带缓冲的 channel。这样调用方如果因为 `ctx` 超时提前返回，actor 后续发送响应时不会永久阻塞。
+2. 发送请求和等待响应都监听 `ctx.Done()`。否则 actor 队列满或处理慢时，调用方会被无限挂住。
+
+Actor 的生产使用方式：
+
+- 每个 actor 的队列必须有上限，满了要返回忙碌错误或降级。
+- actor 处理逻辑不能做慢 IO。慢 IO 应该拆到外部 worker，结果再发回 actor 更新状态。
+- 单 actor 吞吐有限，需要按业务 key 分区。例如 `stockID % 128` 路由到不同 actor。
+- actor 的生命周期要可控，空闲 actor 要能回收，否则海量 key 会创建海量 goroutine。
+
+小结：线程安全设计的核心不是选择“锁还是 channel”，而是决定状态由谁拥有、谁能修改、修改是否有顺序要求、读者看到的是否必须是强一致状态。
 
 ---
 
@@ -1634,6 +1945,113 @@ flowchart TD
 
 这是一种重要的工程取舍：用可接受的延迟换稳定性和吞吐。
 
+### 10.3 三种 Top K 实现方式
+
+Top K 没有唯一答案。常见实现有三类：全量排序、小根堆、QuickSelect。它们的差别在于是否需要完整有序、是否持续更新、实现复杂度是否可接受。
+
+#### 全量排序：简单但成本高
+
+```go
+func TopKBySort(items []UserScore, k int) []UserScore {
+	if k <= 0 {
+		return nil
+	}
+
+	cp := append([]UserScore(nil), items...)
+	sort.Slice(cp, func(i, j int) bool {
+		if cp[i].Score != cp[j].Score {
+			return cp[i].Score > cp[j].Score
+		}
+		return cp[i].UserID < cp[j].UserID
+	})
+
+	if k > len(cp) {
+		k = len(cp)
+	}
+	return cp[:k]
+}
+```
+
+全量排序适合数据量不大、K 接近 N、或者结果必须完整有序的场景。它的优点是简单、稳定、容易测试；缺点是 `O(n log n)`，当 N 很大且 K 很小时浪费明显。
+
+#### 小根堆：大数据小 K 的常用方案
+
+小根堆的核心是“只保留有希望进入 Top K 的元素”。堆大小固定为 K，堆顶是当前 Top K 里最低分。新元素如果不超过堆顶，直接忽略。
+
+```go
+func TopKByHeap(items []UserScore, k int) []UserScore {
+	if k <= 0 {
+		return nil
+	}
+
+	h := &MinHeap{}
+	heap.Init(h)
+
+	for _, item := range items {
+		if h.Len() < k {
+			heap.Push(h, item)
+			continue
+		}
+		if item.Score > (*h)[0].Score {
+			(*h)[0] = item
+			heap.Fix(h, 0)
+		}
+	}
+
+	out := make([]UserScore, h.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(h).(UserScore)
+	}
+	return out
+}
+```
+
+这里使用 `heap.Fix` 替代 `Pop + Push`，可以少一次调整。复杂度是 `O(n log k)`，当 `k` 远小于 `n` 时收益明显。
+
+#### QuickSelect：只找分界线
+
+QuickSelect 的思想是快速找到第 K 大的分界点，然后只排序前 K 个候选。它平均复杂度接近 `O(n)`，但实现比堆更容易写错，最坏情况会退化。
+
+```go
+func TopKByQuickSelect(items []UserScore, k int) []UserScore {
+	if k <= 0 {
+		return nil
+	}
+	if k >= len(items) {
+		return TopKBySort(items, k)
+	}
+
+	cp := append([]UserScore(nil), items...)
+	// nthElement 是 QuickSelect 的分区函数：将第 k 大的元素放到 cp[k-1] 位置，
+	// 并使 cp[:k] 都不小于 cp[k:]。完整实现可以参考算法教材；为保证最坏情况稳定，
+	// 生产中通常采用随机化或 median-of-medians 选择枢轴。
+	nthElement(cp, k)
+
+	top := append([]UserScore(nil), cp[:k]...)
+	sort.Slice(top, func(i, j int) bool {
+		if top[i].Score != top[j].Score {
+			return top[i].Score > top[j].Score
+		}
+		return top[i].UserID < top[j].UserID
+	})
+	return top
+}
+```
+
+生产建议：业务代码里优先使用排序或堆。QuickSelect 适合离线任务、算法库或对性能非常敏感且有充分测试的场景。在线服务里，清晰和稳定通常比少量平均性能收益更重要。
+
+### 10.4 生产中的 Top K 不是一个函数
+
+真实 Top K 往往是一个系统问题，而不是一个函数问题。以“全站实时热词 Top 100”为例，生产实现通常分为几层：
+
+1. 写入层：接收用户搜索词，先做清洗、归一化、限流。
+2. 分片聚合层：按词 hash 到多个 shard，局部计数。
+3. 局部 Top K：每个 shard 定期产出 Top 100 或 Top 200 候选。
+4. 全局合并层：合并各 shard 候选，生成全局快照。
+5. 查询层：只读不可变快照，保证低延迟。
+
+这套设计的原理是把高频写入和高频读取解耦。写入不直接维护一个全局大锁结构，读取不每次触发全量计算。代价是结果有刷新延迟，但系统容量大幅提升。
+
 ---
 
 ## 11. 高频访问优化
@@ -1675,6 +2093,94 @@ flowchart TD
 - 对读多写少的数据，可以使用本地内存缓存 + 远程缓存两级结构，但要注意本地缓存失效和容量上限。
 - 热路径里不要同步打印大日志，不要每次都 JSON 序列化大对象，可以缓存序列化结果。
 - 缓存不是一致性方案。涉及资金、库存、权限等关键数据时，缓存只能加速读取，最终判断仍应基于权威存储或强一致服务。
+
+### 11.2 热路径优化示例：缓存序列化结果
+
+很多接口的瓶颈不是数据库，而是每次请求都重复构造响应、排序、JSON 序列化。对于读多写少的数据，可以把序列化后的结果也放入快照。
+
+```go
+type TopSnapshot struct {
+	Entries []Entry
+	JSON    []byte
+	At      time.Time
+}
+
+type TopCache struct {
+	value atomic.Value // stores *TopSnapshot
+}
+
+func (c *TopCache) LoadJSON() ([]byte, bool) {
+	v := c.value.Load()
+	if v == nil {
+		return nil, false
+	}
+	s := v.(*TopSnapshot)
+	return append([]byte(nil), s.JSON...), true
+}
+
+func (c *TopCache) Store(entries []Entry) error {
+	cp := append([]Entry(nil), entries...)
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	c.value.Store(&TopSnapshot{
+		Entries: cp,
+		JSON:    data,
+		At:      time.Now(),
+	})
+	return nil
+}
+```
+
+这里 `LoadJSON` 返回 `JSON` 的副本，是为了避免调用方修改内部字节切片。生产中如果响应写出后不会被修改，也可以通过约定减少拷贝，但前提是团队能严格遵守不可变规则。
+
+这个优化背后的原理是“把重复计算从请求路径移到刷新路径”。如果榜单每秒刷新一次，而接口每秒被请求 5 万次，序列化一次和序列化 5 万次的成本差别非常大。
+
+### 11.3 singleflight 的正确使用位置
+
+`singleflight` 适合放在缓存回源处，而不是整个接口入口处。下面是一个典型 cache-aside 读取：
+
+```go
+type UserService struct {
+	cache Cache
+	group singleflight.Group
+}
+
+func (s *UserService) GetUser(ctx context.Context, id int64) (*User, error) {
+	key := fmt.Sprintf("user:%d", id)
+
+	if u, ok := s.cache.Get(key); ok {
+		return u.(*User), nil
+	}
+
+	v, err, _ := s.group.Do(key, func() (any, error) {
+		if u, ok := s.cache.Get(key); ok {
+			return u.(*User), nil
+		}
+
+		u, err := loadUserFromDB(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		s.cache.Set(key, u, 5*time.Minute)
+		return u, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*User), nil
+}
+```
+
+回调里再次读缓存是必要的。因为当前 goroutine 等待进入 singleflight 回调期间，可能已经有别的请求把缓存填好了。这个二次检查可以减少不必要的 DB 访问。
+
+生产注意点：
+
+- singleflight 只合并同进程内的请求，多实例部署时还需要远程缓存或分布式锁配合。
+- 不要对所有用户共用同一个 key，否则会把无关请求串行化。
+- 回源必须有超时。否则热点 key 的所有等待者都会被一个慢查询拖住。
+- 对不存在的数据也要缓存短 TTL 的空值，防止穿透。
 
 ---
 
@@ -1738,6 +2244,93 @@ flowchart LR
 - 同时记录业务发生时间和服务接收时间。
 - 保留原始日志，必要时重算。
 
+### 12.4 示例：分钟桶聚合器
+
+下面的例子实现了一个按分钟聚合的计数器。它适合教学理解增量聚合的基本形态：
+
+```go
+type Event struct {
+	Action    string
+	EventTime time.Time
+}
+
+type minuteKey struct {
+	Action string
+	Minute int64
+}
+
+type MinuteAggregator struct {
+	mu      sync.RWMutex
+	buckets map[minuteKey]int64
+}
+
+func NewMinuteAggregator() *MinuteAggregator {
+	return &MinuteAggregator{buckets: make(map[minuteKey]int64)}
+}
+
+func minuteOf(t time.Time) int64 {
+	return t.Unix() / 60
+}
+
+func (a *MinuteAggregator) Add(e Event) {
+	key := minuteKey{
+		Action: e.Action,
+		Minute: minuteOf(e.EventTime),
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.buckets[key]++
+}
+
+func (a *MinuteAggregator) Count(action string, start, end time.Time) int64 {
+	startMinute := minuteOf(start)
+	endMinute := minuteOf(end.Add(-time.Nanosecond))
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	var total int64
+	for m := startMinute; m <= endMinute; m++ {
+		total += a.buckets[minuteKey{Action: action, Minute: m}]
+	}
+	return total
+}
+```
+
+这个实现故意简单，便于理解，但生产中还需要补几件事：
+
+- 查询窗口使用 `[start, end)`，所以计算结束分钟时要处理边界。
+- `Add` 要拒绝过早或过晚的事件，避免攻击者或错误客户端创建无限历史桶。
+- `buckets` 要定期清理，否则服务运行越久内存越大。
+- 如果 action 很多，单个 Map 会变成热点，应按 action 或用户分片。
+
+### 12.5 多级桶查询的原理
+
+分钟桶适合查最近几十分钟，天桶适合查几个月。多级桶查询的原则是：边界用细粒度，中间完整区间用粗粒度。
+
+假设要查 `[10:07, 13:42)`：
+
+```text
+10:07 - 10:59  使用分钟桶
+11:00 - 12:59  使用小时桶
+13:00 - 13:42  使用分钟桶
+```
+
+这样既保证边界精度，又避免扫描 215 个分钟桶。窗口越大，多级桶收益越明显。
+
+生产中常见结构：
+
+```go
+type MultiLevelAggregator struct {
+	minutes *MinuteAggregator
+	hours   *HourAggregator
+	days    *DayAggregator
+}
+```
+
+小时桶和天桶可以由后台任务从已经完整的分钟桶归并出来。注意不要聚合“还在变化的当前分钟”，否则迟到事件会导致小时桶与分钟桶不一致。常见做法是延迟 1 到 2 分钟再归并完整分钟。
+
 ---
 
 # 第五部分：工程化设计
@@ -1768,6 +2361,42 @@ type Store interface {
 - 不暴露内部锁、Map、Skiplist。
 - 对分页、过滤、排序使用请求对象，避免参数爆炸。
 
+### 13.1 用请求对象表达查询语义
+
+当参数超过三四个时，继续堆函数参数会让接口难以演进。请求对象可以清楚表达默认值、边界和兼容性。
+
+```go
+type TopNRequest struct {
+	Board     string
+	Limit     int
+	Offset    int
+	Consistent bool
+}
+
+type TopNResponse struct {
+	Entries   []Entry
+	SnapshotAt time.Time
+	Stale      bool
+}
+
+type Leaderboard interface {
+	AddScore(ctx context.Context, board string, member string, delta int64) (Entry, error)
+	TopN(ctx context.Context, req TopNRequest) (TopNResponse, error)
+	Rank(ctx context.Context, board string, member string) (Entry, error)
+}
+```
+
+`Consistent` 不一定意味着系统必须提供强一致实现，但它给接口留下了表达空间。比如当前版本只支持快照查询，可以在 `Consistent=true` 时返回 `ErrUnsupportedConsistency`，而不是以后破坏接口签名。
+
+生产接口要把一致性语义写清楚：
+
+- `AddScore` 返回的是写入后的实时分数，还是排队后的受理结果？
+- `TopN` 是实时榜单，还是最近一次快照？
+- `Rank` 找不到用户时返回 `ErrNotFound`，还是返回空排名？
+- 分页过程中榜单刷新，是否保证同一页视图一致？
+
+这些问题不提前定义，调用方会根据自己的理解使用接口，后续很难兼容。
+
 ---
 
 ## 14. 错误处理
@@ -1790,6 +2419,54 @@ func loadUser(id int64) error {
 - 不用字符串比较错误。
 - 区分可重试和不可重试错误。
 - 不要每一层都重复打日志。
+
+### 14.1 给错误加上稳定语义
+
+生产系统里，错误不仅给人看，也给程序判断。推荐定义稳定错误，再用 `errors.Is` 判断：
+
+```go
+var (
+	ErrNotFound       = errors.New("not found")
+	ErrBusy           = errors.New("busy")
+	ErrInvalidRequest = errors.New("invalid request")
+)
+
+func validateTopN(n int) error {
+	if n <= 0 || n > 1000 {
+		return fmt.Errorf("%w: n must be in [1,1000]", ErrInvalidRequest)
+	}
+	return nil
+}
+
+func writeHTTPError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrInvalidRequest):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, ErrBusy):
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	default:
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+}
+```
+
+这里不要用字符串比较。字符串是给人看的，后续很容易变化；错误类型和错误码才是给程序判断的。
+
+生产日志也要避免重复。通常在边界层打日志，例如 HTTP handler、消息消费入口、定时任务入口。底层函数只负责 wrap 错误上下文：
+
+```go
+func LoadBoard(ctx context.Context, id string) (*Board, error) {
+	board, err := repo.FindBoard(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("find board %s: %w", id, err)
+	}
+	return board, nil
+}
+```
+
+如果每一层都打印一次同一个错误，线上日志会被放大，排障反而更困难。
 
 ---
 
@@ -1816,6 +2493,79 @@ go test -bench=. -benchmem ./...
 ```
 
 并发结构一定要跑 race test。性能优化一定要跑 benchmark。
+
+### 15.1 指标要和系统边界对应
+
+指标不是越多越好，而是要覆盖关键边界。以 worker pool 为例，至少要有：
+
+```text
+pool_submit_total{result="ok|busy|timeout"}
+pool_queue_length
+pool_task_duration_seconds
+pool_worker_busy
+pool_panic_total
+```
+
+这些指标对应系统的核心问题：
+
+- `submit_total` 看入口是否被拒绝。
+- `queue_length` 看是否积压。
+- `task_duration` 看处理是否变慢。
+- `worker_busy` 看 worker 是否打满。
+- `panic_total` 看任务是否有未处理异常。
+
+日志适合记录离散事件，指标适合观察趋势，trace 适合定位单次请求路径，pprof 适合分析 CPU、内存和 goroutine。不要试图用日志替代所有观测手段。
+
+### 15.2 并发测试示例
+
+并发数据结构要同时测正确性和 race。下面是分片计数器的测试思路：
+
+```go
+func TestShardedCounterConcurrentAdd(t *testing.T) {
+	c := NewShardedCounter()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				c.Add("hot", 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := c.Value("hot"); got != 100000 {
+		t.Fatalf("value=%d, want=100000", got)
+	}
+}
+```
+
+运行：
+
+```bash
+go test -race ./...
+```
+
+`-race` 不能证明没有并发 bug，但能抓住大量真实问题。对核心并发结构，race test 应该是 CI 的一部分。
+
+### 15.3 benchmark 要回答具体问题
+
+不要为了 benchmark 而 benchmark。好的 benchmark 应该回答一个选择题：`Mutex` 和 `RWMutex` 哪个更适合这个读写比例？分片数 32 和 128 哪个更好？快照查询是否真的比实时排序快？
+
+```go
+func BenchmarkShardedCounterAdd(b *testing.B) {
+	c := NewShardedCounter()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Add("user:123", 1)
+		}
+	})
+}
+```
+
+如果所有 goroutine 都写同一个 key，这个 benchmark 测的是热点竞争；如果 key 随机分布，测的是分片扩展性。两者都重要，但含义完全不同。写 benchmark 时要让数据分布接近真实流量。
 
 ---
 
@@ -1908,6 +2658,108 @@ flowchart LR
 
 一个生产级 worker pool 至少应该具备：有界队列、提交超时、错误回调、panic recover、优雅关闭、指标暴露。否则它只是一个教学示例。
 
+### 16.4 教学版 worker pool 实现
+
+下面的实现展示核心结构：有界队列、提交超时、panic recover、关闭等待。
+
+```go
+var ErrPoolClosed = errors.New("pool closed")
+var ErrPoolBusy = errors.New("pool busy")
+
+type Task func(context.Context) error
+
+type Pool struct {
+	queue chan Task
+	wg    sync.WaitGroup
+
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	closed    chan struct{}
+	onError   func(error)
+}
+
+func NewPool(workers int, queueSize int, onError func(error)) *Pool {
+	p := &Pool{
+		queue:   make(chan Task, queueSize),
+		closed:  make(chan struct{}),
+		onError: onError,
+	}
+
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go p.worker()
+	}
+	return p
+}
+
+func (p *Pool) Submit(ctx context.Context, task Task) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	select {
+	case <-p.closed:
+		return ErrPoolClosed
+	default:
+	}
+
+	select {
+	case p.queue <- task:
+		return nil
+	case <-p.closed:
+		return ErrPoolClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ErrPoolBusy
+	}
+}
+
+func (p *Pool) worker() {
+	defer p.wg.Done()
+
+	for task := range p.queue {
+		func() {
+			defer func() {
+				if r := recover(); r != nil && p.onError != nil {
+					p.onError(fmt.Errorf("task panic: %v", r))
+				}
+			}()
+
+			if err := task(context.Background()); err != nil && p.onError != nil {
+				p.onError(err)
+			}
+		}()
+	}
+}
+
+func (p *Pool) Shutdown(ctx context.Context) error {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		close(p.closed)
+		close(p.queue)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+这个版本仍然是教学版，因为它没有指标、任务级超时、优先级、动态扩缩容和 drain 进度。但它已经具备生产实现的骨架。
+
+注意 `Submit` 中的 `default` 表示队列满时快速失败。如果业务希望短暂等待，可以移除 `default`，让它等待 `ctx` 超时或入队成功，但此时不要在等待入队期间长期持有关闭锁。在线请求通常更适合快速失败；后台任务可以接受有限等待。
+
 ---
 
 ## 17. Fan-out / Fan-in：并行也会放大流量
@@ -1965,6 +2817,78 @@ flowchart TD
 | 最快成功 | 多机房读 |
 | Quorum | 多副本系统 |
 | Best effort | 日志、埋点 |
+
+### 17.1 示例：带并发上限的批量查询
+
+批量查询最容易写成“每个 ID 一个 goroutine”。更稳妥的方式是使用 `errgroup.SetLimit` 限制并发：
+
+```go
+func LoadUsers(ctx context.Context, ids []int64) ([]User, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
+	results := make([]User, len(ids))
+
+	for i, id := range ids {
+		i, id := i, id
+		g.Go(func() error {
+			user, err := loadUser(ctx, id)
+			if err != nil {
+				return err
+			}
+			results[i] = user
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+```
+
+这里每个 goroutine 写不同下标，所以不会互相覆盖。但如果写的是同一个 Map，就必须加锁或先写局部结果再合并。
+
+`SetLimit(20)` 的生产含义不是“20 一定最好”，而是给下游设置最大并发。这个值应该参考下游连接池、服务限流、压测结果和入口 QPS。没有这个上限时，一个大请求就可能瞬间打满下游。
+
+### 17.2 拿到足够结果后取消剩余请求
+
+有些场景只需要最快成功的一份结果，例如多机房读：
+
+```go
+func Fastest(ctx context.Context, replicas []string, key string) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		value string
+		err   error
+	}
+	ch := make(chan result, len(replicas))
+
+	for _, replica := range replicas {
+		replica := replica
+		go func() {
+			value, err := readFromReplica(ctx, replica, key)
+			ch <- result{value: value, err: err}
+		}()
+	}
+
+	var lastErr error
+	for range replicas {
+		r := <-ch
+		if r.err == nil {
+			cancel()
+			return r.value, nil
+		}
+		lastErr = r.err
+	}
+	return "", lastErr
+}
+```
+
+`ch` 用带缓冲是为了避免 `cancel()` 后其它 goroutine 返回时卡在发送结果上。生产中还要限制 replicas 数量，或者复用 worker pool，避免一次请求启动过多 goroutine。
 
 ---
 
@@ -2025,6 +2949,85 @@ flowchart TD
 - 背压应该尽量发生在靠近入口的位置，越早拒绝，浪费越少。
 - 不要把背压全部转移给数据库。数据库通常是更稀缺也更共享的资源。
 
+### 18.1 背压要变成代码分支
+
+背压不是文档里的口号，而是明确的代码路径。下面是一个有界写入队列：
+
+```go
+type AsyncWriter struct {
+	queue chan Event
+}
+
+func NewAsyncWriter(size int) *AsyncWriter {
+	return &AsyncWriter{queue: make(chan Event, size)}
+}
+
+func (w *AsyncWriter) Write(ctx context.Context, e Event) error {
+	select {
+	case w.queue <- e:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ErrBusy
+	}
+}
+```
+
+这个实现的行为非常明确：
+
+- 队列没满：接受任务。
+- 请求已经取消：返回取消错误。
+- 队列已满：立即返回 `ErrBusy`。
+
+如果业务不能丢任务，可以把 `default` 去掉，让请求等待一小段时间：
+
+```go
+func (w *AsyncWriter) WriteWait(ctx context.Context, e Event) error {
+	select {
+	case w.queue <- e:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+但等待必须受 `ctx` 控制。无限等待会把压力从队列转移到请求 goroutine，最后表现为 goroutine 数暴涨和入口超时。
+
+### 18.2 丢弃策略也要符合业务语义
+
+不同队列满时的处理策略不同：
+
+```go
+type LatestQueue struct {
+	mu    sync.Mutex
+	items []Event
+	limit int
+}
+
+func (q *LatestQueue) Push(e Event) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.items) == q.limit {
+		copy(q.items[0:], q.items[1:])
+		q.items[len(q.items)-1] = e
+		return
+	}
+	q.items = append(q.items, e)
+}
+```
+
+这个队列满时丢弃最旧事件，保留最新事件。它适合“状态刷新”类任务，例如更新用户在线状态、刷新推荐缓存。不适合订单、支付、库存，因为旧事件同样有业务价值。
+
+生产实践中，背压策略应该写进接口文档和指标：
+
+- 返回 `ErrBusy` 的请求是否应该重试？
+- 客户端重试等待多久？
+- 丢弃了多少任务？
+- 被丢弃的任务是否有补偿路径？
+
 ---
 
 ## 19. 限流：系统的安全阀
@@ -2076,6 +3079,83 @@ flowchart LR
 - 限流配置要能动态调整，并设置安全默认值。
 - 限流不能只看 QPS，还要看请求成本。一次复杂查询可能抵得上几十次普通查询。
 - 返回限流错误时，告诉调用方是否可重试以及建议等待时间。
+
+### 19.1 令牌桶原理
+
+令牌桶可以理解为一个桶按固定速率产生令牌，请求进来必须先拿令牌。桶有容量上限，所以可以允许短暂突发，但长期平均速率不会超过生成速率。
+
+```text
+每秒产生 100 个令牌，桶容量 200
+空闲 2 秒后桶满，可瞬间处理 200 个请求
+之后如果请求持续到来，平均只能每秒通过 100 个
+```
+
+这比漏桶更适合在线服务，因为真实流量往往有短暂突刺。完全平滑会增加延迟，适度突发能提升用户体验。
+
+### 19.2 使用 x/time/rate 实现接口限流
+
+Go 常用 `golang.org/x/time/rate`：
+
+```go
+type RateLimiter struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+}
+
+func NewRateLimiter() *RateLimiter {
+	return &RateLimiter{limiters: make(map[string]*rate.Limiter)}
+}
+
+func (r *RateLimiter) Allow(key string) bool {
+	r.mu.Lock()
+	limiter, ok := r.limiters[key]
+	if !ok {
+		limiter = rate.NewLimiter(rate.Limit(100), 200)
+		r.limiters[key] = limiter
+	}
+	r.mu.Unlock()
+
+	return limiter.Allow()
+}
+```
+
+这里的 key 可以是 `userID`、`tenantID`、`apiName` 或组合键。不同 key 使用独立 limiter，避免一个大客户把所有用户的额度用光。
+
+生产中还要补：
+
+- limiter map 的清理，否则无限用户会让内存增长。
+- 配置动态调整，例如不同租户不同额度。
+- 分布式限流。如果服务有很多实例，本地限流只能限制单实例，不能限制全局。
+- 请求成本权重。复杂查询可以消耗多个 token。
+
+### 19.3 限流和背压的区别
+
+限流发生在请求进入系统前，目标是控制速率；背压发生在系统处理不过来时，目标是反馈容量不足。
+
+一个接口可能同时使用两者：
+
+```go
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.limiter.Allow(userKey(r)) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	if err := h.pool.Submit(r.Context(), h.makeTask(r)); err != nil {
+		if errors.Is(err, ErrPoolBusy) {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+```
+
+限流返回 `429`，表示调用方超过配额；背压返回 `503` 或业务 busy 错误，表示服务当前容量不足。区分这两者有助于调用方选择不同重试策略。
 
 ---
 
@@ -2208,6 +3288,351 @@ score desc, updated_at asc, member_id asc
 - 对超大榜单可以把实时写入和查询拆开：写入进消息队列，聚合服务消费更新榜单，查询服务只读快照或 Redis Sorted Set。
 - 对用户可见榜单，要考虑反作弊、分数回滚、重复事件幂等和补偿重算。
 
+### 20.6 教学案例：分片快照排行榜
+
+下面实现一个教学版排行榜。它不依赖第三方库，重点展示生产设计里的几个核心点：
+
+- 写入按 member 分片，降低锁竞争。
+- 每个 shard 保存真实分数。
+- 后台或调用方触发 `Refresh` 生成不可变 TopN 快照。
+- `TopN` 从 `atomic.Value` 读取快照，不阻塞写入。
+- 排序规则稳定，避免同分排名抖动。
+
+先定义数据结构：
+
+```go
+type Entry struct {
+	Member    string
+	Score     int64
+	UpdatedAt time.Time
+	Rank      int
+}
+
+type boardShard struct {
+	mu     sync.RWMutex
+	scores map[string]Entry
+}
+
+type Board struct {
+	shards []boardShard
+	topK   int
+	snap   atomic.Value // stores []Entry
+}
+
+func NewBoard(shardCount int, topK int) *Board {
+	if shardCount <= 0 {
+		shardCount = 64
+	}
+	if topK <= 0 {
+		topK = 100
+	}
+
+	b := &Board{
+		shards: make([]boardShard, shardCount),
+		topK:   topK,
+	}
+	for i := range b.shards {
+		b.shards[i].scores = make(map[string]Entry)
+	}
+	b.snap.Store([]Entry{})
+	return b
+}
+```
+
+`snap` 里保存的是不可变快照。写入路径永远不修改它，只在刷新时整体替换。
+
+member 到 shard 的映射：
+
+```go
+func (b *Board) shardFor(member string) *boardShard {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(member))
+	return &b.shards[int(h.Sum32())%len(b.shards)]
+}
+```
+
+增加分数：
+
+```go
+func (b *Board) AddScore(member string, delta int64, now time.Time) Entry {
+	s := b.shardFor(member)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.scores[member]
+	entry.Member = member
+	entry.Score += delta
+	entry.UpdatedAt = now
+	s.scores[member] = entry
+	return entry
+}
+```
+
+这里 `AddScore` 只锁一个 shard。它返回的是实时分数，但不承诺实时排名。这个语义很重要：写入吞吐高时，实时更新全局排名会把所有写请求拉回一把全局锁或一个全局有序结构。
+
+快照刷新：
+
+```go
+func (b *Board) Refresh() {
+	h := &entryMinHeap{}
+	heap.Init(h)
+
+	for i := range b.shards {
+		s := &b.shards[i]
+		s.mu.RLock()
+		for _, entry := range s.scores {
+			pushTopK(h, entry, b.topK)
+		}
+		s.mu.RUnlock()
+	}
+
+	result := make([]Entry, h.Len())
+	for i := len(result) - 1; i >= 0; i-- {
+		result[i] = heap.Pop(h).(Entry)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return better(result[i], result[j])
+	})
+	for i := range result {
+		result[i].Rank = i + 1
+	}
+
+	b.snap.Store(result)
+}
+
+func pushTopK(h *entryMinHeap, entry Entry, k int) {
+	if h.Len() < k {
+		heap.Push(h, entry)
+		return
+	}
+	if better(entry, (*h)[0]) {
+		(*h)[0] = entry
+		heap.Fix(h, 0)
+	}
+}
+```
+
+`Refresh` 的成本与用户总数有关，所以它不应该在每次 `TopN` 请求中执行。生产中通常由后台 ticker 定期刷新，例如每秒一次：
+
+```go
+func (b *Board) StartRefresh(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				b.Refresh()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+```
+
+堆和排序规则：
+
+```go
+type entryMinHeap []Entry
+
+func (h entryMinHeap) Len() int { return len(h) }
+
+func (h entryMinHeap) Less(i, j int) bool {
+	return worse(h[i], h[j])
+}
+
+func (h entryMinHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *entryMinHeap) Push(x any) {
+	*h = append(*h, x.(Entry))
+}
+
+func (h *entryMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func better(a, b Entry) bool {
+	if a.Score != b.Score {
+		return a.Score > b.Score
+	}
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.Before(b.UpdatedAt)
+	}
+	return a.Member < b.Member
+}
+
+func worse(a, b Entry) bool {
+	return better(b, a)
+}
+```
+
+这个排序规则表示：分数越高越靠前；同分时更早达到该分数的人靠前；如果时间也相同，member 字典序小的靠前。生产榜单一定要有完整排序键，否则同分用户会因为 Map 遍历顺序而排名抖动。
+
+读取 TopN：
+
+```go
+func (b *Board) TopN(n int) []Entry {
+	entries := b.snap.Load().([]Entry)
+	if n > len(entries) {
+		n = len(entries)
+	}
+	if n <= 0 {
+		return nil
+	}
+
+	out := make([]Entry, n)
+	copy(out, entries[:n])
+	return out
+}
+```
+
+返回副本是为了保护内部快照。如果调用方修改返回的切片，不会污染下一次查询。
+
+查询用户排名可以先做快照语义：
+
+```go
+func (b *Board) Rank(member string) (Entry, bool) {
+	entries := b.snap.Load().([]Entry)
+	for _, entry := range entries {
+		if entry.Member == member {
+			return entry, true
+		}
+	}
+	return Entry{}, false
+}
+```
+
+这个 `Rank` 只在 TopK 快照中查找用户，复杂度是 `O(k)`。如果业务要求任意用户排名，就不能只保存 TopK，需要使用 Skiplist、Redis Sorted Set，或者在刷新快照时构建 `map[member]rank`。
+
+### 20.7 多榜单管理器
+
+实际业务通常有日榜、周榜、活动榜等多个 board。管理器负责创建和查找榜单：
+
+```go
+type BoardManager struct {
+	mu     sync.RWMutex
+	boards map[string]*Board
+}
+
+func NewBoardManager() *BoardManager {
+	return &BoardManager{boards: make(map[string]*Board)}
+}
+
+func (m *BoardManager) GetOrCreate(name string) *Board {
+	m.mu.RLock()
+	board := m.boards[name]
+	m.mu.RUnlock()
+	if board != nil {
+		return board
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if board = m.boards[name]; board != nil {
+		return board
+	}
+	board = NewBoard(64, 100)
+	m.boards[name] = board
+	return board
+}
+
+func (m *BoardManager) AddScore(boardName, member string, delta int64) Entry {
+	board := m.GetOrCreate(boardName)
+	return board.AddScore(member, delta, time.Now())
+}
+
+func (m *BoardManager) TopN(boardName string, n int) []Entry {
+	m.mu.RLock()
+	board := m.boards[boardName]
+	m.mu.RUnlock()
+	if board == nil {
+		return nil
+	}
+	return board.TopN(n)
+}
+```
+
+这里使用“双重检查”避免每次都加写锁。第一次读锁找不到时，再进入写锁；进入写锁后还要再查一次，因为可能有另一个 goroutine 已经创建了 board。
+
+生产扩展方向：
+
+- 增加 board 生命周期管理，长期无人访问的活动榜要清理。
+- `Refresh` 失败要保留旧快照，并记录失败指标。
+- 如果榜单写入量极高，`Refresh` 扫全量用户会变重，需要每个 shard 维护局部 TopK 候选。
+- 分数变更要幂等。活动积分通常来自事件流，必须用事件 ID 去重，避免消息重试重复加分。
+
+### 20.8 HTTP API 示例
+
+教学项目可以先暴露两个接口：
+
+```go
+func addScoreHandler(m *BoardManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		board := r.URL.Query().Get("board")
+		member := r.URL.Query().Get("member")
+		delta, err := strconv.ParseInt(r.URL.Query().Get("delta"), 10, 64)
+		if err != nil || board == "" || member == "" {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		entry := m.AddScore(board, member, delta)
+		_ = json.NewEncoder(w).Encode(entry)
+	}
+}
+
+func topNHandler(m *BoardManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		board := r.URL.Query().Get("board")
+		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+		if n <= 0 {
+			n = 10
+		}
+
+		entries := m.TopN(board, n)
+		_ = json.NewEncoder(w).Encode(entries)
+	}
+}
+```
+
+这个 HTTP 层只用于教学。生产接口还要补鉴权、限流、请求体大小限制、错误码、指标、访问日志和超时控制。
+
+### 20.9 Leaderboard 练习验收标准
+
+完成这个案例后，至少做三类验证：
+
+```go
+func TestBoardTopNStableOrder(t *testing.T) {
+	b := NewBoard(4, 10)
+	now := time.Now()
+	b.AddScore("b", 10, now)
+	b.AddScore("a", 10, now)
+	b.AddScore("c", 20, now)
+	b.Refresh()
+
+	got := b.TopN(3)
+	if got[0].Member != "c" || got[1].Member != "a" || got[2].Member != "b" {
+		t.Fatalf("unexpected order: %#v", got)
+	}
+}
+```
+
+```bash
+go test -race ./...
+go test -bench=Board -benchmem ./...
+```
+
+压测时分别看写入吞吐、`TopN` p99、`Refresh` 耗时和内存占用。如果 `Refresh` 耗时接近刷新间隔，说明快照生成已经成为瓶颈，需要局部 TopK 或外部存储。
+
 ---
 
 ## 21. ActivityTracker 高级实现
@@ -2334,6 +3759,411 @@ func (t *Tracker) Record(ctx context.Context, e Event) error {
 - 指标至少包括入队成功数、入队失败数、队列长度、消费延迟、聚合耗时、桶数量、丢弃数。
 - 如果查询跨度很大，禁止扫描过多分钟桶，应自动切换到小时桶或天桶。
 
+### 21.6 教学案例：异步活动追踪器
+
+下面实现一个教学版 `ActivityTracker`。它覆盖真实系统的核心结构：
+
+- `Record` 只做轻量校验和入队。
+- 有界队列提供背压。
+- 多个 worker 异步消费事件。
+- 聚合器按 action 和分钟分桶。
+- 查询读取聚合桶，而不是扫描原始事件。
+- 关闭时停止接收新事件并等待 worker 退出。
+
+先定义事件和错误：
+
+```go
+var ErrTrackerClosed = errors.New("tracker closed")
+var ErrTrackerBusy = errors.New("tracker busy")
+var ErrInvalidEvent = errors.New("invalid event")
+
+type ActivityEvent struct {
+	ID        string
+	UserID    string
+	Action    string
+	EventTime time.Time
+	IngestTime time.Time
+}
+```
+
+`ID` 用于幂等。`EventTime` 是业务发生时间，`IngestTime` 是服务接收时间。生产中两者都要保存，因为统计口径和排障口径不同。
+
+聚合 shard：
+
+```go
+type actionMinute struct {
+	Action string
+	Minute int64
+}
+
+type trackerShard struct {
+	mu      sync.RWMutex
+	counts  map[actionMinute]int64
+	seenIDs map[string]struct{}
+}
+
+func (s *trackerShard) init() {
+	s.counts = make(map[actionMinute]int64)
+	s.seenIDs = make(map[string]struct{})
+}
+
+func (s *trackerShard) add(e ActivityEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e.ID != "" {
+		if _, ok := s.seenIDs[e.ID]; ok {
+			return
+		}
+		s.seenIDs[e.ID] = struct{}{}
+	}
+
+	key := actionMinute{
+		Action: e.Action,
+		Minute: e.EventTime.Unix() / 60,
+	}
+	s.counts[key]++
+}
+```
+
+`seenIDs` 是教学版幂等实现。生产中不能无限保存所有 ID，通常会设置 TTL、使用 Redis、布隆过滤器，或者依赖上游消息系统的 exactly-once/幂等语义。
+
+查询窗口统计：
+
+```go
+func (s *trackerShard) count(action string, start, end time.Time) int64 {
+	startMinute := start.Unix() / 60
+	endMinute := end.Add(-time.Nanosecond).Unix() / 60
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var total int64
+	for m := startMinute; m <= endMinute; m++ {
+		total += s.counts[actionMinute{Action: action, Minute: m}]
+	}
+	return total
+}
+```
+
+这个查询只适合短窗口。长窗口要使用小时桶和天桶，否则扫描分钟数过多。
+
+Tracker 主体：
+
+```go
+type ActivityTracker struct {
+	queue  chan ActivityEvent
+	shards []trackerShard
+
+	mu        sync.RWMutex
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func NewActivityTracker(workerCount int, queueSize int, shardCount int) *ActivityTracker {
+	if workerCount <= 0 {
+		workerCount = 8
+	}
+	if queueSize <= 0 {
+		queueSize = 10000
+	}
+	if shardCount <= 0 {
+		shardCount = 64
+	}
+
+	t := &ActivityTracker{
+		queue:  make(chan ActivityEvent, queueSize),
+		shards: make([]trackerShard, shardCount),
+		closed: make(chan struct{}),
+	}
+	for i := range t.shards {
+		t.shards[i].init()
+	}
+	for i := 0; i < workerCount; i++ {
+		t.wg.Add(1)
+		go t.worker()
+	}
+	return t
+}
+```
+
+写入入口：
+
+```go
+func (t *ActivityTracker) Record(ctx context.Context, e ActivityEvent) error {
+	if e.Action == "" || e.EventTime.IsZero() {
+		return ErrInvalidEvent
+	}
+	if e.IngestTime.IsZero() {
+		e.IngestTime = time.Now()
+	}
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	select {
+	case <-t.closed:
+		return ErrTrackerClosed
+	default:
+	}
+
+	select {
+	case t.queue <- e:
+		return nil
+	case <-t.closed:
+		return ErrTrackerClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ErrTrackerBusy
+	}
+}
+```
+
+这里的 `default` 是背压策略：队列满了立刻失败。对于埋点类事件，可以返回成功但记录丢弃数；对于关键行为事件，应返回明确错误，让调用方进入可靠重试或消息队列。
+
+worker 和 shard 路由：
+
+```go
+func (t *ActivityTracker) worker() {
+	defer t.wg.Done()
+
+	for e := range t.queue {
+		shard := t.shardFor(e.Action)
+		shard.add(e)
+	}
+}
+
+func (t *ActivityTracker) shardFor(action string) *trackerShard {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(action))
+	return &t.shards[int(h.Sum32())%len(t.shards)]
+}
+```
+
+这里按 action 分片，适合查询 action 维度统计。如果写入热点是单个 action，例如 `page_view` 占 90%，这个分片会失效。生产中可以改为按 `(action, userID)` 或事件 ID 分片，查询时再跨 shard 汇总。
+
+查询接口：
+
+```go
+func (t *ActivityTracker) Count(action string, start, end time.Time) int64 {
+	if !start.Before(end) {
+		return 0
+	}
+
+	var total int64
+	for i := range t.shards {
+		total += t.shards[i].count(action, start, end)
+	}
+	return total
+}
+```
+
+即使按 action 分片，这里仍然遍历所有 shard，是为了让未来分片策略变化时查询语义不变。生产中如果明确 action 只会落到一个 shard，可以直接查目标 shard，但代码耦合会更强。
+
+优雅关闭：
+
+```go
+func (t *ActivityTracker) Shutdown(ctx context.Context) error {
+	t.closeOnce.Do(func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+
+		close(t.closed)
+		close(t.queue)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+```
+
+关闭顺序是：先关闭 `closed`，让新请求被拒绝；再关闭队列，让 worker 消费完已入队事件后退出。这个版本没有持久化 flush，如果事件不能丢，关闭前还要把未处理事件写入 WAL 或可靠消息队列。
+
+### 21.7 TopActions 查询
+
+`TopActions(start, end, n)` 的朴素做法是扫描窗口内所有桶，累加每个 action 的计数，然后用堆取 TopN：
+
+```go
+type ActionCount struct {
+	Action string
+	Count  int64
+}
+
+func (t *ActivityTracker) TopActions(start, end time.Time, n int) []ActionCount {
+	if n <= 0 || !start.Before(end) {
+		return nil
+	}
+
+	total := make(map[string]int64)
+	for i := range t.shards {
+		t.shards[i].fillRange(total, start, end)
+	}
+
+	h := &actionMinHeap{}
+	heap.Init(h)
+	for action, count := range total {
+		item := ActionCount{Action: action, Count: count}
+		if h.Len() < n {
+			heap.Push(h, item)
+			continue
+		}
+		if item.Count > (*h)[0].Count {
+			(*h)[0] = item
+			heap.Fix(h, 0)
+		}
+	}
+
+	out := make([]ActionCount, h.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(h).(ActionCount)
+	}
+	return out
+}
+
+func (s *trackerShard) fillRange(total map[string]int64, start, end time.Time) {
+	startMinute := start.Unix() / 60
+	endMinute := end.Add(-time.Nanosecond).Unix() / 60
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for key, count := range s.counts {
+		if key.Minute >= startMinute && key.Minute <= endMinute {
+			total[key.Action] += count
+		}
+	}
+}
+```
+
+这个实现容易理解，但生产中要注意：如果 action 和桶都很多，扫描所有 `counts` 会变慢。优化方向有两个：
+
+- 按时间组织桶：`map[minute]map[action]count`，查询窗口时只扫相关分钟。
+- 后台维护 TopActions 快照：查询直接读快照，适合热门固定窗口，如最近 5 分钟、1 小时、24 小时。
+
+堆实现：
+
+```go
+type actionMinHeap []ActionCount
+
+func (h actionMinHeap) Len() int { return len(h) }
+
+func (h actionMinHeap) Less(i, j int) bool {
+	if h[i].Count != h[j].Count {
+		return h[i].Count < h[j].Count
+	}
+	return h[i].Action > h[j].Action
+}
+
+func (h actionMinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *actionMinHeap) Push(x any) {
+	*h = append(*h, x.(ActionCount))
+}
+
+func (h *actionMinHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+```
+
+### 21.8 过期清理和迟到事件
+
+内存聚合器必须清理旧桶：
+
+```go
+func (t *ActivityTracker) Cleanup(before time.Time) {
+	beforeMinute := before.Unix() / 60
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		for key := range s.counts {
+			if key.Minute < beforeMinute {
+				delete(s.counts, key)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+```
+
+清理策略要和迟到事件策略一致。如果允许修正最近 10 分钟，就不能清理 10 分钟内的桶。常见配置：
+
+```text
+实时修正窗口：10 分钟
+内存保留窗口：2 小时
+离线明细保留：7 天或更久
+```
+
+如果事件晚到超过实时修正窗口，生产系统通常不直接修改内存聚合，而是写入补偿队列，由离线任务重算历史报表。这样实时系统不会被非常旧的事件拖慢。
+
+### 21.9 ActivityTracker 验收标准
+
+这个案例完成后，至少验证四件事：
+
+```go
+func TestActivityTrackerCount(t *testing.T) {
+	tracker := NewActivityTracker(2, 100, 4)
+	defer tracker.Shutdown(context.Background())
+
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		err := tracker.Record(context.Background(), ActivityEvent{
+			ID:        fmt.Sprintf("e-%d", i),
+			UserID:    "u1",
+			Action:    "click",
+			EventTime: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requireEventually(t, func() bool {
+		return tracker.Count("click", now.Add(-time.Minute), now.Add(time.Minute)) == 10
+	})
+}
+
+func requireEventually(t *testing.T, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+```
+
+测试异步系统时不要立刻断言，因为事件还在队列里。可以使用 `require.Eventually`，或者在教学代码里提供 `Flush` 方法等待队列处理完成。
+
+压测和观测重点：
+
+- `Record` 成功数、失败数、`ErrTrackerBusy` 数量。
+- 队列长度和队列等待时间。
+- worker 消费延迟，即 `now - ingest_time`。
+- 聚合桶数量和内存占用。
+- `TopActions` 查询的 p99 延迟。
+
+生产落地时，`ActivityTracker` 通常不会单独运行在业务进程里。更常见的架构是：业务服务把事件写入 Kafka、Pulsar、NATS 或本地 WAL，聚合服务异步消费并维护实时视图。这样业务入口不会被统计系统拖慢，统计系统故障也不会直接影响核心交易链路。
+
 ---
 
 # 附录 A：补充并发原语
@@ -2447,7 +4277,7 @@ func Aggregate(ctx context.Context, userID int64) (Profile, error) {
 要点：
 
 - 任何子任务返回 error，`errgroup` 会自动 cancel 关联的 ctx，其它子任务应尽快退出。
-- Go 1.20 之后的 `errgroup.SetLimit(n)` 可以限制同时运行的 goroutine 数，非常适合批量 fan-out。
+- `golang.org/x/sync/errgroup` 提供的 `errgroup.SetLimit(n)` 可以限制同时运行的 goroutine 数（需要 `golang.org/x/sync` v0.1.0 及以上），非常适合批量 fan-out。
 - 子任务内部必须检查 `ctx.Done()`，否则 cancel 没有意义。
 
 ## A.5 singleflight：合并重复请求
